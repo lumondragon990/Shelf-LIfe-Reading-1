@@ -511,6 +511,8 @@ export default function ShelfLife() {
   const [recLoading, setRecLoading] = useState(false);
   const [aiNext, setAiNext] = useState({}); // bookId -> [ai picks]
   const [aiNextLoading, setAiNextLoading] = useState(false);
+  const [morePicks, setMorePicks] = useState(null);
+  const [morePicksLoading, setMorePicksLoading] = useState(false);
   const [points, setPoints] = useState(0);
   const [quizResults, setQuizResults] = useState({}); // bookId -> {score, total, passed, at}
   const [bookQuiz, setBookQuiz] = useState(null); // {bookId, title, loading, questions, answers, submitted, score, earned}
@@ -909,6 +911,50 @@ export default function ShelfLife() {
     setAiNextLoading(false);
   };
 
+  // ----- "More like this": live wider-library picks matched to quiz taste -----
+  const TAG_SUBJECTS = {
+    Funny: "humorous fiction", Adventure: "adventure stories", Heartwarming: "friendship fiction",
+    Fantasy: "fantasy fiction", Mystery: "detective and mystery stories", Romance: "romance fiction",
+    "Sci-fi": "science fiction", Nonfiction: "biography", Classics: "classic literature",
+    "Short reads": "novellas", "Pictures inside": "graphic novels",
+  };
+  const fetchMorePicks = async () => {
+    if (!quiz) return;
+    setMorePicksLoading(true);
+    try {
+      const { tagScores, audience, lang } = scoreQuiz(quiz);
+      const topTags = Object.entries(tagScores).sort((a, b) => b[1] - a[1]).map(([t]) => t)
+        .filter((t) => TAG_SUBJECTS[t]).slice(0, 2);
+      const subjects = topTags.length ? topTags.map((t) => TAG_SUBJECTS[t]) : ["fiction"];
+      const curated = new Set(PICKS.map((x) => x.title.toLowerCase()));
+      const seen = new Set([...onShelfTitles, ...curated]);
+      const out = [];
+      for (const subj of subjects) {
+        const q = audience === "kid" ? `subject:"juvenile fiction" ${subj}` : `subject:"${subj}"`;
+        const langParam = lang === "es" ? "&langRestrict=es" : "";
+        const r = await fetch(`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}${langParam}&maxResults=14&orderBy=relevance`);
+        const d = await r.json();
+        for (const it of d.items || []) {
+          const v = it.volumeInfo || {};
+          const t = (v.title || "").toLowerCase();
+          if (!v.title || seen.has(t)) continue;
+          seen.add(t);
+          out.push({
+            key: it.id, title: v.title, author: (v.authors || [])[0] || "",
+            pages: v.pageCount || "", why: subj,
+            cover: v.imageLinks?.smallThumbnail?.replace("http://", "https://") || null,
+          });
+          if (out.length >= 12) break;
+        }
+        if (out.length >= 12) break;
+      }
+      setMorePicks(out);
+    } catch {
+      flash("Couldn't load more picks — try again in a moment");
+    }
+    setMorePicksLoading(false);
+  };
+
   // ----- Personality quiz helpers -----
   const finishQuiz = (answers) => {
     persist({ quiz: answers });
@@ -1024,7 +1070,7 @@ export default function ShelfLife() {
         </div>
         <p style={{ margin: "6px 0 0", color: T.inkSoft, fontSize: 15 }}>
           Track your books, find your next one, and talk about them with other readers. Go at your own pace — this is your shelf, not a race.
-          <span style={{ fontSize: 11, opacity: 0.55, marginLeft: 8 }}>v7</span>
+          <span style={{ fontSize: 11, opacity: 0.55, marginLeft: 8 }}>v9</span>
         </p>
       </header>
 
@@ -1712,7 +1758,7 @@ export default function ShelfLife() {
               (() => {
                 const { tagScores, audience } = scoreQuiz(quiz);
                 const arch = ARCHETYPES[topTag(tagScores)];
-                const matches = matchBooks(quiz).filter((m) => !onShelfTitles.has(m.title.toLowerCase())).slice(0, 5);
+                const matches = matchBooks(quiz).filter((m) => !onShelfTitles.has(m.title.toLowerCase())).slice(0, 12);
                 return (
                   <div>
                     {/* Archetype card */}
@@ -1764,6 +1810,43 @@ export default function ShelfLife() {
                         <p style={{ color: T.inkSoft }}>
                           You've already shelved all your best matches — impressive! Try the button below for fresh ideas.
                         </p>
+                      )}
+                    </div>
+
+                    {/* Live wider-library picks */}
+                    <div style={{ marginTop: 18 }}>
+                      <button style={{ ...ghostBtn, opacity: morePicksLoading ? 0.6 : 1 }} disabled={morePicksLoading} onClick={fetchMorePicks}>
+                        {morePicksLoading ? "Searching the stacks…" : morePicks ? "Refresh the stacks ↻" : "📚 Show more like this (from the wider library)"}
+                      </button>
+                      {morePicks && morePicks.length > 0 && (
+                        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: 12, marginTop: 12 }}>
+                          {morePicks.map((r) => {
+                            const owned = onShelfTitles.has(r.title.toLowerCase());
+                            return (
+                              <div key={r.key} style={{
+                                border: `1px solid ${T.rule}`, borderRadius: 10, padding: 12,
+                                background: T.paper, display: "flex", gap: 10,
+                              }}>
+                                {r.cover ? (
+                                  <img src={r.cover} alt="" style={{ width: 52, height: 76, objectFit: "cover", borderRadius: 4, flexShrink: 0, boxShadow: "1px 2px 5px rgba(34,51,77,0.25)" }} />
+                                ) : (
+                                  <div style={{ width: 52, height: 76, borderRadius: 4, flexShrink: 0, background: spineColor(r.title), boxShadow: "inset -4px 0 rgba(0,0,0,0.18)" }} />
+                                )}
+                                <div style={{ display: "flex", flexDirection: "column", gap: 3, minWidth: 0 }}>
+                                  <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 600, fontSize: 15, lineHeight: 1.2 }}>{r.title}</div>
+                                  <div style={{ fontSize: 12, color: T.inkSoft }}>{r.author}{r.pages ? ` · ${r.pages} pages` : ""}</div>
+                                  <div style={{ fontSize: 12, color: T.green, fontWeight: 700 }}>✓ {r.why}</div>
+                                  <button
+                                    style={{ ...(owned ? ghostBtn : btn(T.green)), marginTop: "auto", padding: "6px 12px", fontSize: 12, opacity: owned ? 0.6 : 1, cursor: owned ? "default" : "pointer" }}
+                                    disabled={owned}
+                                    onClick={() => addBook({ title: r.title, author: r.author, pages: r.pages || 200, status: "want" })}>
+                                    {owned ? "On your shelf ✓" : "Add to shelf"}
+                                  </button>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
                       )}
                     </div>
 
@@ -2469,11 +2552,41 @@ function BookTitleInput({ value, onChange, onPick, placeholder }) {
     const t = setTimeout(async () => {
       setLoading(true);
       try {
-        const r = await fetch(
-          `https://openlibrary.org/search.json?q=${encodeURIComponent(q)}&limit=10&fields=key,title,author_name,number_of_pages_median,cover_i,first_publish_year`
-        );
-        const d = await r.json();
-        setResults(d.docs || []);
+        // Search BOTH catalogs at once and merge — far wider coverage
+        const [ol, gb] = await Promise.allSettled([
+          fetch(`https://openlibrary.org/search.json?q=${encodeURIComponent(q)}&limit=15&fields=key,title,author_name,number_of_pages_median,cover_i,first_publish_year`).then((r) => r.json()),
+          fetch(`https://www.googleapis.com/books/v1/volumes?q=${encodeURIComponent(q)}&maxResults=12`).then((r) => r.json()),
+        ]);
+        const merged = [];
+        const seen = new Set();
+        const push = (item) => {
+          const sig = `${(item.title || "").toLowerCase()}|${(item.author || "").toLowerCase()}`;
+          if (item.title && !seen.has(sig)) { seen.add(sig); merged.push(item); }
+        };
+        if (ol.status === "fulfilled") {
+          (ol.value.docs || []).forEach((d) => push({
+            key: `ol-${d.key}`,
+            title: d.title,
+            author: (d.author_name || [])[0] || "",
+            pages: d.number_of_pages_median || "",
+            year: d.first_publish_year || "",
+            cover: d.cover_i ? `https://covers.openlibrary.org/b/id/${d.cover_i}-S.jpg` : null,
+          }));
+        }
+        if (gb.status === "fulfilled") {
+          (gb.value.items || []).forEach((it) => {
+            const v = it.volumeInfo || {};
+            push({
+              key: `gb-${it.id}`,
+              title: v.title,
+              author: (v.authors || [])[0] || "",
+              pages: v.pageCount || "",
+              year: (v.publishedDate || "").slice(0, 4),
+              cover: v.imageLinks?.smallThumbnail?.replace("http://", "https://") || null,
+            });
+          });
+        }
+        setResults(merged.slice(0, 20));
         setOpen(true);
       } catch { /* quiet fail — manual typing still works */ }
       setLoading(false);
@@ -2505,10 +2618,10 @@ function BookTitleInput({ value, onChange, onPick, placeholder }) {
         <div style={{
           position: "absolute", top: "calc(100% + 4px)", left: 0, right: 0, zIndex: 40,
           background: T.card, border: `1.5px solid ${T.blue}`, borderRadius: 10,
-          maxHeight: 280, overflowY: "auto", boxShadow: "0 8px 24px rgba(34,51,77,0.22)",
+          maxHeight: 380, overflowY: "auto", boxShadow: "0 8px 24px rgba(34,51,77,0.22)",
         }}>
           {results.map((r) => {
-            const author = (r.author_name || [])[0] || "";
+            const author = r.author;
             return (
               <button
                 key={r.key}
@@ -2517,8 +2630,7 @@ function BookTitleInput({ value, onChange, onPick, placeholder }) {
                   onPick({
                     title: r.title,
                     author,
-                    pages: r.number_of_pages_median || "",
-                    coverId: r.cover_i || null,
+                    pages: r.pages || "",
                   });
                   setOpen(false);
                 }}
@@ -2529,8 +2641,8 @@ function BookTitleInput({ value, onChange, onPick, placeholder }) {
                   fontFamily: "'Atkinson Hyperlegible', sans-serif",
                 }}
               >
-                {r.cover_i ? (
-                  <img src={`https://covers.openlibrary.org/b/id/${r.cover_i}-S.jpg`} alt=""
+                {r.cover ? (
+                  <img src={r.cover} alt=""
                     style={{ width: 28, height: 40, objectFit: "cover", borderRadius: 3, flexShrink: 0 }} />
                 ) : (
                   <div style={{ width: 28, height: 40, borderRadius: 3, flexShrink: 0, background: spineColor(r.title) }} />
@@ -2538,7 +2650,7 @@ function BookTitleInput({ value, onChange, onPick, placeholder }) {
                 <span style={{ minWidth: 0 }}>
                   <span style={{ display: "block", fontWeight: 700, fontSize: 14, color: T.ink, lineHeight: 1.2 }}>{r.title}</span>
                   <span style={{ display: "block", fontSize: 12, color: T.inkSoft }}>
-                    {author}{r.first_publish_year ? ` \u00b7 ${r.first_publish_year}` : ""}{r.number_of_pages_median ? ` \u00b7 ${r.number_of_pages_median} pages` : ""}
+                    {author}{r.year ? ` · ${r.year}` : ""}{r.pages ? ` · ${r.pages} pages` : ""}
                   </span>
                 </span>
               </button>
