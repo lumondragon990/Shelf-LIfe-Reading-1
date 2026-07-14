@@ -1134,15 +1134,25 @@ export default function ShelfLife() {
   };
 
   const lookupWord = async (raw) => {
-    const word = (raw || "").toLowerCase().replace(/[^a-záéíóúñü''-]/gi, "");
+    const word = (raw || "").toLowerCase().replace(/[^a-záéíóúñü'-]/gi, "");
     if (!word || word.length < 2) return;
     setWordCard({ word, loading: true });
     speakWord(word);
-    const isSpanish = /[áéíóúñü]/i.test(word);
-    const langs = isSpanish ? ["es", "en"] : ["en", "es"];
-    for (const lang of langs) {
+
+    // Layer 1 + 2: free dictionary, trying the word and its common stems
+    const stems = [word];
+    if (word.endsWith("ies")) stems.push(word.slice(0, -3) + "y");
+    if (word.endsWith("es")) stems.push(word.slice(0, -2));
+    if (word.endsWith("s")) stems.push(word.slice(0, -1));
+    if (word.endsWith("ed")) { stems.push(word.slice(0, -2)); stems.push(word.slice(0, -1)); }
+    if (word.endsWith("ing")) { stems.push(word.slice(0, -3)); stems.push(word.slice(0, -3) + "e"); }
+    if (word.endsWith("ly")) stems.push(word.slice(0, -2));
+    if (word.endsWith("er")) stems.push(word.slice(0, -2));
+    if (word.endsWith("est")) stems.push(word.slice(0, -3));
+
+    for (const w of [...new Set(stems)]) {
       try {
-        const r = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/${lang}/${encodeURIComponent(word)}`);
+        const r = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(w)}`);
         if (!r.ok) continue;
         const d = await r.json();
         const entry = Array.isArray(d) ? d[0] : null;
@@ -1150,16 +1160,39 @@ export default function ShelfLife() {
         const def = meaning?.definitions?.[0]?.definition;
         if (def) {
           setWordCard({
-            word: entry.word || word,
+            word,
             phonetic: entry.phonetic || (entry.phonetics || []).find((x) => x.text)?.text || "",
             pos: meaning.partOfSpeech || "",
-            definition: def,
+            definition: def + (w !== word ? ` (from "${w}")` : ""),
             loading: false,
           });
           return;
         }
-      } catch { /* try next language */ }
+      } catch { /* try next */ }
     }
+
+    // Layer 3: ask Claude — handles Spanish, old-timey words, names, anything
+    try {
+      const response = await fetch("/api/claude", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-haiku-4-5",
+          max_tokens: 150,
+          messages: [{
+            role: "user",
+            content: `In ONE short, simple sentence, explain the word "${word}" for a beginner reader. If it is a Spanish word, explain it in simple Spanish. If it looks like a name or a made-up word from a story, briefly say so. Respond with only that one sentence — no preamble, no quotes.`,
+          }],
+        }),
+      });
+      const data = await response.json();
+      const text = (data.content || []).filter((x) => x.type === "text").map((x) => x.text).join(" ").trim();
+      if (text) {
+        setWordCard({ word, definition: text, pos: "", phonetic: "", ai: true, loading: false });
+        return;
+      }
+    } catch { /* fall through */ }
+
     setWordCard({ word, notFound: true, loading: false });
   };
 
@@ -1374,7 +1407,7 @@ export default function ShelfLife() {
         </div>
         <p style={{ margin: "6px 0 0", color: T.inkSoft, fontSize: 15 }}>
           Track your books, find your next one, and talk about them with other readers. Go at your own pace — this is your shelf, not a race.
-          <span style={{ fontSize: 11, opacity: 0.55, marginLeft: 8 }}>v14</span>
+          <span style={{ fontSize: 11, opacity: 0.55, marginLeft: 8 }}>v15</span>
         </p>
       </header>
 
@@ -3147,7 +3180,7 @@ export default function ShelfLife() {
               <div style={{ fontSize: 14, marginTop: 4 }}>
                 {wordCard.loading ? "Looking it up…" : wordCard.notFound
                   ? "Couldn't find a definition for that one — but you can still hear it out loud."
-                  : wordCard.definition}
+                  : <>{wordCard.definition}{wordCard.ai && <span style={{ marginLeft: 6, fontSize: 11, color: T.blue }}>✨</span>}</>}
               </div>
             </div>
           )}
