@@ -77,6 +77,11 @@ const ALL_TAGS = ["All", "En español", "Short reads", "Funny", "Adventure", "He
 // For school or classroom deployments, set this to false to remove the section entirely:
 const SHOW_AFTER_DARK = true;
 
+// SCHOOL MODE: set to true for classroom/district deployments.
+// Hides the public community wall, meetups, and the After Dark shelf entirely —
+// one flag, FERPA-friendlier build, same codebase.
+const SCHOOL_MODE = false;
+
 const MATURE_SHELF = {
   romance: {
     label: "Spicy romance", emoji: "🌶️",
@@ -412,9 +417,9 @@ async function loadShelf() {
   try {
     const r = await storage.get("shelf-data-v1");
     const d = r ? JSON.parse(r.value) : {};
-    return { books: d.books || [], readDays: d.readDays || [], goalDays: d.goalDays || 4, quiz: d.quiz || null, points: d.points || 0, quizResults: d.quizResults || {}, classroom: d.classroom || null, teaching: d.teaching || null, digitalShelf: d.digitalShelf || [], myWords: d.myWords || [], voicePref: d.voicePref || "female" };
+    return { books: d.books || [], readDays: d.readDays || [], goalDays: d.goalDays || 4, quiz: d.quiz || null, points: d.points || 0, quizResults: d.quizResults || {}, classroom: d.classroom || null, teaching: d.teaching || null, digitalShelf: d.digitalShelf || [], myWords: d.myWords || [], voicePref: d.voicePref || "female", onboarded: d.onboarded || false, userName: d.userName || "", role: d.role || "" };
   } catch {
-    return { books: [], readDays: [], goalDays: 4, quiz: null, points: 0, quizResults: {}, classroom: null, teaching: null, digitalShelf: [], myWords: [], voicePref: "female" };
+    return { books: [], readDays: [], goalDays: 4, quiz: null, points: 0, quizResults: {}, classroom: null, teaching: null, digitalShelf: [], myWords: [], voicePref: "female", onboarded: false, userName: "", role: "" };
   }
 }
 async function saveShelf(data) {
@@ -554,7 +559,12 @@ function Ruled({ children, style }) {
 
 // ---------- Main ----------
 export default function ShelfLife() {
-  const [tab, setTab] = useState("shelf");
+  const [tab, setTab] = useState("today");
+  const [onboarded, setOnboarded] = useState(true); // true until load says otherwise (no flash)
+  const [userName, setUserName] = useState("");
+  const [role, setRole] = useState("");
+  const [obStep, setObStep] = useState(0);
+  const [obName, setObName] = useState("");
   const [books, setBooks] = useState([]);
   const [readDays, setReadDays] = useState([]);
   const [goalDays, setGoalDays] = useState(4);
@@ -601,6 +611,9 @@ export default function ShelfLife() {
   const [wordCard, setWordCard] = useState(null); // {word, loading, phonetic, pos, definition, notFound}
   const [myWords, setMyWords] = useState([]); // [{word, definition, at}]
   const [voicePref, setVoicePref] = useState("female");
+  const [syncCode, setSyncCode] = useState(null);
+  const [syncInput, setSyncInput] = useState("");
+  const [syncBusy, setSyncBusy] = useState(false);
   const [wordQuiz, setWordQuiz] = useState(null); // {questions, answers, submitted, score}
   const [showWords, setShowWords] = useState(false);
   const [recap, setRecap] = useState(null); // {bookId, loading, text}
@@ -634,6 +647,13 @@ export default function ShelfLife() {
       setDigitalShelf(d.digitalShelf || []);
       setMyWords(d.myWords || []);
       setVoicePref(d.voicePref || "female");
+      setOnboarded(d.onboarded || false);
+      setUserName(d.userName || "");
+      setRole(d.role || "");
+      if (d.userName) {
+        setJoinForm((f) => (f.name ? f : { ...f, name: d.userName }));
+        setPostForm((f) => (f.name ? f : { ...f, name: d.userName }));
+      }
       // Warm up the voice list (it loads async in most browsers)
       try { window.speechSynthesis?.getVoices?.(); window.speechSynthesis.onvoiceschanged = () => {}; } catch { /* noop */ }
       if (d.quiz) setPickTag(topTag(scoreQuiz(d.quiz).tagScores));
@@ -879,7 +899,7 @@ export default function ShelfLife() {
   };
 
   const persist = (patch) => {
-    const next = { books, readDays, goalDays, quiz, points, quizResults, classroom, teaching, digitalShelf, myWords, voicePref, ...patch };
+    const next = { books, readDays, goalDays, quiz, points, quizResults, classroom, teaching, digitalShelf, myWords, voicePref, onboarded, userName, role, ...patch };
     setBooks(next.books);
     setReadDays(next.readDays);
     setGoalDays(next.goalDays);
@@ -891,6 +911,9 @@ export default function ShelfLife() {
     setDigitalShelf(next.digitalShelf);
     setMyWords(next.myWords);
     setVoicePref(next.voicePref);
+    setOnboarded(next.onboarded);
+    setUserName(next.userName);
+    setRole(next.role);
     saveShelf(next);
   };
   const withToday = (days) => (days.includes(todayKey()) ? days : [...days, todayKey()]);
@@ -1185,29 +1208,71 @@ export default function ShelfLife() {
     return best;
   };
 
+  // Robust speech: Chrome swallows speak() right after cancel(), gets stuck in a
+  // paused state, garbage-collects utterances mid-speech, and some premium voices
+  // fail silently. This wrapper works around all four, retrying once with the
+  // default voice if the fancy one produces nothing.
+  const safeSpeak = (u) => {
+    try {
+      window.__slU = u; // keep a reference so Chrome's GC can't eat it mid-speech
+      let spoke = false;
+      const origBoundary = u.onboundary;
+      u.onboundary = (e) => { spoke = true; if (origBoundary) origBoundary(e); };
+      const origStart = u.onstart;
+      u.onstart = (e) => { spoke = true; if (origStart) origStart(e); };
+      window.speechSynthesis.cancel();
+      setTimeout(() => {
+        try {
+          window.speechSynthesis.resume(); // un-stick a paused engine
+          window.speechSynthesis.speak(u);
+        } catch { /* noop */ }
+        // If nothing came out within 1.5s, retry once with the default voice
+        setTimeout(() => {
+          if (spoke || u.__retried) return;
+          try {
+            window.speechSynthesis.cancel();
+            const r = new SpeechSynthesisUtterance(u.text);
+            r.lang = u.lang; r.rate = u.rate; r.pitch = u.pitch;
+            r.onboundary = u.onboundary; r.onend = u.onend;
+            r.__retried = true;
+            u.__retried = true;
+            window.__slU = r;
+            window.speechSynthesis.resume();
+            window.speechSynthesis.speak(r);
+          } catch { /* noop */ }
+        }, 1500);
+      }, 80);
+    } catch { /* noop */ }
+  };
+
   // ----- Read to me: speaks the page, highlighting each word (karaoke mode) -----
-  const startReadAlong = () => {
+  const speakRange = (start, end) => {
     if (!reader?.pages?.length) return;
     try {
-      const text = reader.pages[reader.page];
+      const page = reader.pages[reader.page];
+      const text = page.slice(start, end);
+      if (!text.trim()) return;
       const u = new SpeechSynthesisUtterance(text);
       const accents = (text.match(/[áéíóúñü]/gi) || []).length;
       u.lang = accents > 4 ? "es-ES" : "en-US";
       const v = pickVoice(u.lang, voicePref);
       if (v) u.voice = v;
-      u.rate = 0.88;
-      u.pitch = 0.95;
+      u.rate = 0.92;
+      u.pitch = 1.0;
       u.onboundary = (e) => {
-        if (e.name === "word" || e.charIndex !== undefined) setReadAlong({ on: true, char: e.charIndex });
+        if (e.charIndex !== undefined) setReadAlong({ on: true, char: start + e.charIndex });
       };
       u.onend = () => setReadAlong({ on: false, char: -1 });
       u.onerror = () => setReadAlong({ on: false, char: -1 });
-      window.speechSynthesis.cancel();
-      setReadAlong({ on: true, char: 0 });
-      window.speechSynthesis.speak(u);
+      setReadAlong({ on: true, char: start });
+      safeSpeak(u);
     } catch {
       flash("Read-aloud isn't available in this browser");
     }
+  };
+  const startReadAlong = () => {
+    if (!reader?.pages?.length) return;
+    speakRange(0, reader.pages[reader.page].length);
   };
   const stopReadAlong = () => {
     try { window.speechSynthesis.cancel(); } catch { /* noop */ }
@@ -1266,10 +1331,9 @@ export default function ShelfLife() {
       u.lang = /[áéíóúñü]/i.test(word) ? "es-ES" : "en-US";
       const v = pickVoice(u.lang, voicePref);
       if (v) u.voice = v;
-      u.rate = 0.8;
-      u.pitch = 0.95;
-      window.speechSynthesis.cancel();
-      window.speechSynthesis.speak(u);
+      u.rate = 0.85;
+      u.pitch = 1.0;
+      safeSpeak(u);
     } catch { /* some browsers block speech; the card still shows meaning */ }
   };
 
@@ -1440,6 +1504,57 @@ export default function ShelfLife() {
     setMorePicksLoading(false);
   };
 
+  // ----- First-run onboarding -----
+  const finishOnboarding = (chosenRole) => {
+    const name = obName.trim().slice(0, 30);
+    persist({ onboarded: true, userName: name, role: chosenRole });
+    if (name) {
+      setJoinForm((f) => ({ ...f, name }));
+      setPostForm((f) => ({ ...f, name }));
+      if (chosenRole === "teacher" || chosenRole === "family") setClassForm((f) => ({ ...f, teacher: name, kind: chosenRole === "family" ? "family" : "class" }));
+    }
+    if (chosenRole === "teacher") { setTab("classroom"); setClassMode("teacher-setup"); }
+    else if (chosenRole === "family") { setTab("classroom"); setClassMode("teacher-setup"); }
+    else if (chosenRole === "student") { setTab("classroom"); setClassMode("student-join"); }
+    else { setTab("personality"); }
+    flash(name ? `Welcome to Shelf Life, ${name}! 🌱` : "Welcome to Shelf Life! 🌱");
+  };
+
+  // ----- Device sync: move your shelf to another device with a 6-letter code -----
+  const createSyncCode = async () => {
+    setSyncBusy(true);
+    try {
+      const code = makeClassCode() + makeClassCode().slice(0, 1);
+      const data = { books, readDays, goalDays, quiz, points, quizResults, classroom, teaching, digitalShelf, myWords, voicePref, at: Date.now() };
+      await storage.set(`sync:${code}`, JSON.stringify(data), true);
+      setSyncCode(code);
+    } catch {
+      flash("Couldn't create a sync code — try again");
+    }
+    setSyncBusy(false);
+  };
+  const receiveSyncCode = async () => {
+    const code = syncInput.trim().toUpperCase();
+    if (code.length < 5) return;
+    setSyncBusy(true);
+    try {
+      const r = await storage.get(`sync:${code}`, true);
+      const d = JSON.parse(r.value);
+      persist({
+        books: d.books || [], readDays: d.readDays || [], goalDays: d.goalDays || 4,
+        quiz: d.quiz || null, points: d.points || 0, quizResults: d.quizResults || {},
+        classroom: d.classroom || null, teaching: d.teaching || null,
+        digitalShelf: d.digitalShelf || [], myWords: d.myWords || [],
+      });
+      setSyncInput("");
+      flash("Your shelf is here! Everything synced 📚");
+      setTab("shelf");
+    } catch {
+      flash("No shelf found for that code — double-check it?");
+    }
+    setSyncBusy(false);
+  };
+
   // ----- "Catch me up": spoiler-safe recap of the story so far -----
   const catchMeUp = async (book) => {
     const pct = Math.round(((book.currentPage || 0) / (book.pages || 1)) * 100);
@@ -1603,21 +1718,19 @@ export default function ShelfLife() {
         </div>
         <p style={{ margin: "6px 0 0", color: T.inkSoft, fontSize: 15 }}>
           Track your books, find your next one, and talk about them with other readers. Go at your own pace — this is your shelf, not a race.
-          <span style={{ fontSize: 11, opacity: 0.55, marginLeft: 8 }}>v17</span>
+          <span style={{ fontSize: 11, opacity: 0.55, marginLeft: 8 }}>v18</span>
         </p>
       </header>
 
       {/* Tabs */}
       <nav style={{ maxWidth: 880, margin: "18px auto 0", padding: "0 18px", display: "flex", gap: 8, overflowX: "auto" }}>
         {[
+          ["today", "Today"],
           ["shelf", "My shelf"],
           ["discover", "Find a book"],
-          ["personality", "Personality"],
-          ["foryou", "For you"],
           ["read", "Read 📱"],
-          ["club", "Book club"],
           ["classroom", "Classroom"],
-          ["rewards", "Rewards"],
+          ["more", "More"],
         ].map(([id, label]) => (
           <button
             key={id}
@@ -1625,9 +1738,9 @@ export default function ShelfLife() {
             style={{
               flex: "0 0 auto", padding: "10px 18px", borderRadius: "10px 10px 0 0",
               border: `1.5px solid ${T.rule}`, borderBottom: "none", cursor: "pointer",
-              background: tab === id ? T.card : "rgba(255,255,255,0.35)",
-              color: tab === id ? T.ink : T.inkSoft,
-              fontWeight: tab === id ? 700 : 400, fontSize: 15,
+              background: (tab === id || (id === "more" && ["personality", "foryou", "club", "rewards"].includes(tab))) ? T.card : "rgba(255,255,255,0.35)",
+              color: (tab === id || (id === "more" && ["personality", "foryou", "club", "rewards"].includes(tab))) ? T.ink : T.inkSoft,
+              fontWeight: (tab === id || (id === "more" && ["personality", "foryou", "club", "rewards"].includes(tab))) ? 700 : 400, fontSize: 15,
               fontFamily: "'Atkinson Hyperlegible', sans-serif",
             }}
           >
@@ -1641,6 +1754,179 @@ export default function ShelfLife() {
         background: T.card, border: `1.5px solid ${T.rule}`, borderRadius: "0 12px 12px 12px",
         minHeight: 420,
       }}>
+        {/* ---------------- TODAY ---------------- */}
+        {tab === "today" && (() => {
+          const hour = new Date().getHours();
+          const greeting = hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
+          const currentBook = reading[0] || null;
+          const currentDigital = digitalShelf.find((d) => d.pos > 0) || null;
+          return (
+            <div style={{ animation: "rise .3s ease" }}>
+              <div style={{ fontSize: 13, color: T.inkSoft, letterSpacing: "0.08em", textTransform: "uppercase" }}>
+                {new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })}
+              </div>
+              <h2 style={{ fontFamily: "'Fraunces', serif", fontWeight: 900, fontSize: 28, margin: "2px 0 14px" }}>
+                {greeting}{userName ? `, ${userName}` : ""} 📚
+              </h2>
+
+              {/* Today's encouragement — the heart of the app, front and center */}
+              <div style={{
+                borderLeft: `5px solid ${T.green}`, background: "#F0F5F0", borderRadius: "0 12px 12px 0",
+                padding: "16px 18px", marginBottom: 16,
+              }}>
+                <div style={{ fontFamily: "'Fraunces', serif", fontStyle: "italic", fontSize: 19, lineHeight: 1.4 }}>
+                  “{todaysEncouragement()}”
+                </div>
+              </div>
+
+              {/* Check in / streak */}
+              <div style={{
+                display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap",
+                background: T.paper, border: `1px solid ${T.rule}`, borderRadius: 12, padding: "12px 16px", marginBottom: 12,
+              }}>
+                <div>
+                  <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 900, fontSize: 22 }}>{streak} 🔥</div>
+                  <div style={{ fontSize: 12, color: T.inkSoft }}>
+                    day streak{streak === 0 && readDays.length > 0 ? " · streaks rest too — today's a fresh page 🌱" : ""}
+                  </div>
+                </div>
+                <button style={readToday ? ghostBtn : btn(T.stamp)} onClick={markToday}>
+                  {readToday ? "Read today ✓" : "I read today — any amount counts 🌱"}
+                </button>
+              </div>
+
+              {/* Keep reading */}
+              {(currentBook || currentDigital) && (
+                <div style={{
+                  background: T.paper, border: `1px solid ${T.rule}`, borderLeft: `6px solid ${spineColor((currentBook || currentDigital).title)}`,
+                  borderRadius: 12, padding: "14px 16px", marginBottom: 12,
+                }}>
+                  <div style={{ fontSize: 11, letterSpacing: "0.12em", color: T.blue, fontWeight: 700 }}>KEEP READING</div>
+                  <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 700, fontSize: 19 }}>
+                    {(currentBook || currentDigital).title}
+                  </div>
+                  {currentBook && (
+                    <div style={{ fontSize: 13, color: T.inkSoft, marginBottom: 8 }}>
+                      Page {currentBook.currentPage} of {currentBook.pages} · {Math.round((currentBook.currentPage / currentBook.pages) * 100)}%
+                    </div>
+                  )}
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    {currentBook?.gid || currentDigital ? (
+                      <button style={btn(T.green)} onClick={() => {
+                        const d = digitalShelf.find((x) => x.gid === (currentBook?.gid || currentDigital?.gid));
+                        if (d) openReader(d);
+                      }}>
+                        📱 Open the book
+                      </button>
+                    ) : (
+                      <button style={btn(T.green)} onClick={() => setTab("shelf")}>Update my progress</button>
+                    )}
+                    {currentBook && currentBook.currentPage > 0 && (
+                      <button style={ghostBtn} onClick={() => { setTab("shelf"); catchMeUp(currentBook); }}>
+                        Catch me up 🕯️
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Class at a glance */}
+              {classroom && (
+                <div style={{
+                  background: "#F0F5F0", border: `1.5px solid ${T.green}`, borderRadius: 12,
+                  padding: "12px 16px", marginBottom: 12, display: "flex", justifyContent: "space-between",
+                  alignItems: "center", gap: 10, flexWrap: "wrap",
+                }}>
+                  <div>
+                    <div style={{ fontSize: 11, letterSpacing: "0.12em", color: T.green, fontWeight: 700 }}>
+                      {classroom.kind === "family" ? "FAMILY CIRCLE" : "YOUR CLASS"}
+                    </div>
+                    <div style={{ fontSize: 14 }}>
+                      Chapter <strong>{classroom.chapter || 0}</strong> of {classroom.chapters} in “{classroom.book}”
+                    </div>
+                  </div>
+                  <button style={ghostBtn} onClick={() => setTab("classroom")}>Open →</button>
+                </div>
+              )}
+              {teaching && (
+                <div style={{
+                  background: "#F5F8FC", border: `1.5px solid ${T.blue}`, borderRadius: 12,
+                  padding: "12px 16px", marginBottom: 12, display: "flex", justifyContent: "space-between",
+                  alignItems: "center", gap: 10, flexWrap: "wrap",
+                }}>
+                  <div>
+                    <div style={{ fontSize: 11, letterSpacing: "0.12em", color: T.blue, fontWeight: 700 }}>
+                      {teaching.kind === "family" ? "YOUR FAMILY CIRCLE" : "YOUR CLASS"} · CODE {teaching.code}
+                    </div>
+                    <div style={{ fontSize: 14 }}>“{teaching.book}” · see where your readers are</div>
+                  </div>
+                  <button style={btn()} onClick={() => { setTab("classroom"); loadRoster(teaching.code); }}>Dashboard →</button>
+                </div>
+              )}
+
+              {/* Word review nudge */}
+              {myWords.length >= 4 && (
+                <div style={{
+                  background: T.paper, border: `1px solid ${T.rule}`, borderRadius: 12,
+                  padding: "12px 16px", marginBottom: 12, display: "flex", justifyContent: "space-between",
+                  alignItems: "center", gap: 10, flexWrap: "wrap",
+                }}>
+                  <div style={{ fontSize: 14 }}>
+                    📖 You've collected <strong>{myWords.length} words</strong> — up for a 2-minute review?
+                  </div>
+                  <button style={ghostBtn} onClick={() => { setTab("shelf"); startWordQuiz(); }}>Quick quiz 🧠</button>
+                </div>
+              )}
+
+              {/* Empty-state pointers */}
+              {/* Word of the day (from My Words) */}
+              {myWords.length > 0 && (() => {
+                const w = myWords[new Date().getDate() % myWords.length];
+                return (
+                  <div style={{
+                    background: "#F5F8FC", border: `1.5px dashed ${T.blue}`, borderRadius: 12,
+                    padding: "12px 16px", marginBottom: 12,
+                  }}>
+                    <div style={{ fontSize: 11, letterSpacing: "0.12em", color: T.blue, fontWeight: 700 }}>YOUR WORD OF THE DAY</div>
+                    <div style={{ display: "flex", alignItems: "baseline", gap: 10, flexWrap: "wrap", marginTop: 2 }}>
+                      <span style={{ fontFamily: "'Fraunces', serif", fontWeight: 900, fontSize: 22 }}>{w.word}</span>
+                      <button style={{ ...ghostBtn, padding: "2px 10px", fontSize: 12 }} onClick={() => speakWord(w.word)}>🔊</button>
+                    </div>
+                    <div style={{ fontSize: 14, marginTop: 2 }}>{w.definition}</div>
+                    {myWords.length >= 4 && (
+                      <button style={{ ...ghostBtn, marginTop: 8, padding: "4px 12px", fontSize: 12 }}
+                        onClick={() => { setTab("shelf"); startWordQuiz(); }}>
+                        Review my words 🧠 (+2 pts each)
+                      </button>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {!currentBook && !currentDigital && !classroom && !teaching && (
+                <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+                  <button onClick={() => setTab("personality")} style={{
+                    flex: "1 1 200px", background: T.card, border: `2px solid ${T.blue}`, borderRadius: 12,
+                    padding: "18px 16px", cursor: "pointer", textAlign: "center", fontFamily: "'Atkinson Hyperlegible', sans-serif",
+                  }}>
+                    <div style={{ fontSize: 28 }}>🎭</div>
+                    <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 900, fontSize: 16, color: T.ink }}>Find your reading type</div>
+                    <div style={{ fontSize: 12, color: T.inkSoft }}>2-minute quiz, books matched to you</div>
+                  </button>
+                  <button onClick={() => setTab("read")} style={{
+                    flex: "1 1 200px", background: T.card, border: `2px solid ${T.green}`, borderRadius: 12,
+                    padding: "18px 16px", cursor: "pointer", textAlign: "center", fontFamily: "'Atkinson Hyperlegible', sans-serif",
+                  }}>
+                    <div style={{ fontSize: 28 }}>📱</div>
+                    <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 900, fontSize: 16, color: T.ink }}>Read something free</div>
+                    <div style={{ fontSize: 12, color: T.inkSoft }}>70,000 classics, built right in</div>
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })()}
+
         {/* ---------------- MY SHELF ---------------- */}
         {tab === "shelf" && (
           <div style={{ animation: "rise .3s ease" }}>
@@ -2533,7 +2819,7 @@ export default function ShelfLife() {
                     </div>
 
                     {/* ----- The After Dark Shelf: adults only ----- */}
-                    {SHOW_AFTER_DARK && audience === "adult" && (
+                    {SHOW_AFTER_DARK && !SCHOOL_MODE && audience === "adult" && (
                       <div style={{
                         marginTop: 26, background: T.ink, borderRadius: 14, padding: "18px 18px 16px",
                         color: T.paper,
@@ -3252,6 +3538,84 @@ export default function ShelfLife() {
           </div>
         )}
 
+        {/* ---------------- MORE ---------------- */}
+        {tab === "more" && (
+          <div style={{ animation: "rise .3s ease" }}>
+            <h2 style={{ fontFamily: "'Fraunces', serif", fontWeight: 900, fontSize: 22, margin: "0 0 14px" }}>
+              More of Shelf Life
+            </h2>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 12 }}>
+              {[
+                ["personality", "🎭", "Personality", "Discover your reading type and get matched books"],
+                ["foryou", "📖", "For you", "What to read next, based on books you finished"],
+                ...(SCHOOL_MODE ? [] : [["club", "💬", "Book club", "The community wall and real-world meetups"]]),
+                ["rewards", "🎁", "Rewards", "Your points, levels, streak gifts and the vault"],
+              ].map(([id, emoji, label, desc]) => (
+                <button key={id} onClick={() => setTab(id)} style={{
+                  background: T.paper, border: `1.5px solid ${T.rule}`, borderRadius: 12,
+                  padding: "16px 16px", cursor: "pointer", textAlign: "left",
+                  fontFamily: "'Atkinson Hyperlegible', sans-serif",
+                }}>
+                  <div style={{ fontSize: 26 }}>{emoji}</div>
+                  <div style={{ fontFamily: "'Fraunces', serif", fontWeight: 900, fontSize: 17, color: T.ink }}>{label}</div>
+                  <div style={{ fontSize: 12.5, color: T.inkSoft, marginTop: 2 }}>{desc}</div>
+                </button>
+              ))}
+            </div>
+
+            {/* Device sync */}
+            <div style={{ marginTop: 22 }}>
+              <h3 style={{ fontFamily: "'Fraunces', serif", fontWeight: 700, fontSize: 17, margin: "0 0 4px" }}>
+                📲 Move my shelf to another device
+              </h3>
+              <p style={{ fontSize: 12.5, color: T.inkSoft, margin: "0 0 10px" }}>
+                Reading on your phone AND a Chromebook? Make a code here, type it there — your whole shelf follows you.
+              </p>
+              <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
+                <Ruled style={{ flex: "1 1 240px" }}>
+                  <div style={{ fontWeight: 700, lineHeight: "28px" }}>Send from this device</div>
+                  {syncCode ? (
+                    <div style={{ paddingBottom: 4 }}>
+                      <div style={{
+                        fontFamily: "'Fraunces', serif", fontWeight: 900, fontSize: 26, letterSpacing: "0.18em",
+                        border: `2.5px dashed ${T.stamp}`, borderRadius: 10, padding: "4px 14px",
+                        color: T.stamp, display: "inline-block", margin: "4px 0",
+                      }}>
+                        {syncCode}
+                      </div>
+                      <div style={{ fontSize: 12, color: T.inkSoft }}>Type this code on your other device within the next day.</div>
+                    </div>
+                  ) : (
+                    <button style={{ ...btn(), opacity: syncBusy ? 0.6 : 1 }} disabled={syncBusy} onClick={createSyncCode}>
+                      {syncBusy ? "Creating…" : "Get my sync code"}
+                    </button>
+                  )}
+                </Ruled>
+                <Ruled style={{ flex: "1 1 240px" }}>
+                  <div style={{ fontWeight: 700, lineHeight: "28px" }}>Receive on this device</div>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", paddingBottom: 4 }}>
+                    <input
+                      style={{ ...input, flex: "1 1 120px", textTransform: "uppercase", letterSpacing: "0.15em", fontWeight: 700 }}
+                      placeholder="SYNC CODE" maxLength={6} value={syncInput}
+                      onChange={(e) => setSyncInput(e.target.value.toUpperCase())} />
+                    <button style={{ ...btn(T.green), opacity: syncInput.trim().length >= 5 && !syncBusy ? 1 : 0.5 }}
+                      disabled={syncInput.trim().length < 5 || syncBusy} onClick={receiveSyncCode}>
+                      {syncBusy ? "Syncing…" : "Bring my shelf here"}
+                    </button>
+                  </div>
+                  <div style={{ fontSize: 11.5, color: T.inkSoft, lineHeight: "28px" }}>
+                    Heads up: this replaces what's on this device with the synced shelf.
+                  </div>
+                </Ruled>
+              </div>
+            </div>
+
+            <div style={{ marginTop: 20, fontSize: 11.5, color: T.inkSoft, textAlign: "center" }}>
+              Shelf Life · your shelf, not a race · made in Houston 🤠
+            </div>
+          </div>
+        )}
+
         {/* ---------------- REWARDS ---------------- */}
         {tab === "rewards" && (
           <div style={{ animation: "rise .3s ease" }}>
@@ -3431,6 +3795,85 @@ export default function ShelfLife() {
         )}
       </main>
 
+      {/* ---------------- FIRST-RUN WELCOME ---------------- */}
+      {loaded && !onboarded && (
+        <div style={{
+          position: "fixed", inset: 0, zIndex: 90, background: T.paper,
+          display: "flex", alignItems: "center", justifyContent: "center", padding: 18,
+        }}>
+          <div style={{ maxWidth: 460, width: "100%", textAlign: "center" }}>
+            {/* mini shelf */}
+            <div style={{ display: "flex", alignItems: "flex-end", justifyContent: "center", gap: 4, height: 46 }}>
+              {[["#2B5EA7",34],["#C24632",42],["#3E7C59",30],["#D9A03F",38],["#7C5CB0",44],["#B85C8A",33],["#4A8C9E",40]].map(([c,h],i)=>(
+                <div key={i} style={{ width: 16 + (i%3)*4, height: h, background: c, borderRadius: "3px 3px 0 0", boxShadow: "inset -3px 0 rgba(0,0,0,0.18)" }} />
+              ))}
+            </div>
+            <div style={{ height: 9, background: "#8A6B45", borderRadius: 3, boxShadow: "0 3px 0 #6E5334", margin: "0 40px 20px" }} />
+
+            {obStep === 0 && (
+              <div style={{ animation: "rise .3s ease" }}>
+                <h1 style={{ fontFamily: "'Fraunces', serif", fontWeight: 900, fontSize: 34, margin: 0 }}>Shelf Life</h1>
+                <p style={{ fontFamily: "'Fraunces', serif", fontStyle: "italic", fontSize: 17, color: T.blue, margin: "8px 0 4px" }}>
+                  Your shelf, not a race.
+                </p>
+                <p style={{ fontSize: 15, color: T.inkSoft, margin: "0 0 22px" }}>
+                  Five pages today is a win. So is one. This app cheers for every reader — especially the slow ones.
+                </p>
+                <input
+                  style={{
+                    width: "100%", boxSizing: "border-box", padding: "12px 14px", textAlign: "center",
+                    border: `1.5px solid ${T.rule}`, borderRadius: 10, background: T.card,
+                    color: T.ink, fontSize: 17, fontFamily: "'Atkinson Hyperlegible', sans-serif", outline: "none",
+                  }}
+                  placeholder="What's your first name?"
+                  maxLength={30}
+                  value={obName}
+                  onChange={(e) => setObName(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && setObStep(1)}
+                />
+                <button style={{ ...btn(), width: "100%", marginTop: 12, padding: "12px", fontSize: 16 }}
+                  onClick={() => setObStep(1)}>
+                  {obName.trim() ? `Nice to meet you, ${obName.trim()} →` : "Let's go →"}
+                </button>
+              </div>
+            )}
+
+            {obStep === 1 && (
+              <div style={{ animation: "rise .3s ease" }}>
+                <h2 style={{ fontFamily: "'Fraunces', serif", fontWeight: 900, fontSize: 24, margin: "0 0 4px" }}>
+                  Who's reading{obName.trim() ? `, ${obName.trim()}` : ""}?
+                </h2>
+                <p style={{ fontSize: 13.5, color: T.inkSoft, margin: "0 0 16px" }}>This just helps us open the right door first.</p>
+                <div style={{ display: "grid", gap: 10 }}>
+                  {[
+                    ["reader", "🌱", "I'm reading for me", "Track books, find your taste, go at your own pace"],
+                    ["student", "🎒", "I'm a student", "Join your class with the code your teacher gave you"],
+                    ["teacher", "🍎", "I'm a teacher", "Set up your class, see chapters & quiz progress"],
+                    ["family", "👨‍👩‍👧", "We're a family", "Read together at home with family rewards"],
+                  ].map(([id, emoji, label, desc]) => (
+                    <button key={id} onClick={() => finishOnboarding(id)} style={{
+                      display: "flex", gap: 12, alignItems: "center", textAlign: "left",
+                      background: T.card, border: `1.5px solid ${T.rule}`, borderRadius: 12,
+                      padding: "12px 16px", cursor: "pointer", fontFamily: "'Atkinson Hyperlegible', sans-serif",
+                    }}>
+                      <span style={{ fontSize: 26 }}>{emoji}</span>
+                      <span>
+                        <span style={{ display: "block", fontWeight: 700, fontSize: 15.5, color: T.ink }}>{label}</span>
+                        <span style={{ display: "block", fontSize: 12.5, color: T.inkSoft }}>{desc}</span>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+                <button style={{ background: "none", border: "none", color: T.inkSoft, fontSize: 13, marginTop: 12, cursor: "pointer" }}
+                  onClick={() => setObStep(0)}>
+                  ← back
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* ---------------- READER OVERLAY ---------------- */}
       {reader && (
         <div style={{
@@ -3478,20 +3921,47 @@ export default function ShelfLife() {
                 </div>
                 <div style={{ fontSize: readerFont, lineHeight: 1.7, whiteSpace: "pre-wrap", fontFamily: "'Atkinson Hyperlegible', sans-serif" }}>
                   {(() => {
-                    const segs = reader.pages[reader.page].split(/(\s+)/);
-                    let off = 0;
-                    return segs.map((seg, i) => {
-                      const start = off;
-                      off += seg.length;
-                      if (!/\S/.test(seg)) return seg;
-                      const lit = readAlong.on && readAlong.char >= start && readAlong.char < start + seg.length;
-                      return (
-                        <span key={i} onClick={() => lookupWord(seg)}
-                          style={{ cursor: "pointer", borderRadius: 3, background: lit ? "#FFE9A8" : "transparent", transition: "background .1s" }}>
-                          {seg}
-                        </span>
-                      );
-                    });
+                    const page = reader.pages[reader.page];
+                    // Split into paragraphs (blank-line separated), keeping absolute offsets
+                    const paras = [];
+                    let cursor = 0;
+                    for (const m of page.split(/(\n\s*\n)/)) {
+                      if (/^\n\s*\n$/.test(m)) { cursor += m.length; continue; }
+                      if (m.length) paras.push({ start: cursor, end: cursor + m.length });
+                      cursor += m.length;
+                    }
+                    const renderWords = (start, end) => {
+                      const segs = page.slice(start, end).split(/(\s+)/);
+                      let off = start;
+                      return segs.map((seg, i) => {
+                        const segStart = off;
+                        off += seg.length;
+                        if (!/\S/.test(seg)) return seg;
+                        const lit = readAlong.on && readAlong.char >= segStart && readAlong.char < segStart + seg.length;
+                        return (
+                          <span key={i} onClick={() => lookupWord(seg)}
+                            style={{ cursor: "pointer", borderRadius: 3, background: lit ? "#FFE9A8" : "transparent", transition: "background .1s" }}>
+                            {seg}
+                          </span>
+                        );
+                      });
+                    };
+                    return paras.map((para, pi) => (
+                      <div key={pi} style={{ marginBottom: 16, whiteSpace: "pre-wrap" }}>
+                        <button
+                          aria-label="Listen to this paragraph"
+                          title="Listen to this paragraph"
+                          onClick={() => speakRange(para.start, para.end)}
+                          style={{
+                            background: "none", border: "none", cursor: "pointer",
+                            fontSize: Math.max(12, readerFont - 4), opacity: 0.45,
+                            padding: "0 6px 0 0", verticalAlign: "baseline",
+                          }}>
+                          🔊
+                        </button>
+                        {renderWords(para.start, para.end)}
+                      </div>
+                    ));
                   })()}
                 </div>
               </div>
